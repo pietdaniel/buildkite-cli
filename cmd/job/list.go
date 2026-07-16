@@ -155,9 +155,10 @@ func (c *ListCmd) Run(kongCtx *kong.Context, globals cli.GlobalFlags) error {
 	org := f.Config.OrganizationSlug()
 	var jobs []buildkite.Job
 	var resolvedPipeline *pipeline.Pipeline
+	var queueIDs []string
 
 	if err = bkIO.SpinWhile(f, "Loading jobs", func() error {
-		jobs, resolvedPipeline, err = fetchJobList(ctx, f, org, opts, listOpts)
+		jobs, resolvedPipeline, queueIDs, err = fetchJobList(ctx, f, org, opts, listOpts)
 		return err
 	}); err != nil {
 		return fmt.Errorf("failed to list jobs: %w", err)
@@ -165,7 +166,7 @@ func (c *ListCmd) Run(kongCtx *kong.Context, globals cli.GlobalFlags) error {
 
 	shouldApplyFilters := opts.build != "" || opts.queue == ""
 	if shouldApplyFilters && (opts.queue != "" || len(opts.state) > 0 || opts.duration != "") {
-		jobs, err = applyClientSideFilters(jobs, opts)
+		jobs, err = applyClientSideFilters(jobs, opts, queueIDs)
 		if err != nil {
 			return fmt.Errorf("failed to apply filters: %w", err)
 		}
@@ -206,25 +207,33 @@ func (c *ListCmd) Run(kongCtx *kong.Context, globals cli.GlobalFlags) error {
 	return displayJobs(jobs, format, os.Stdout)
 }
 
-func fetchJobList(ctx context.Context, f *factory.Factory, org string, opts jobListOptions, listOpts *buildkite.BuildsListOptions) ([]buildkite.Job, *pipeline.Pipeline, error) {
+func fetchJobList(ctx context.Context, f *factory.Factory, org string, opts jobListOptions, listOpts *buildkite.BuildsListOptions) ([]buildkite.Job, *pipeline.Pipeline, []string, error) {
 	if opts.build != "" {
 		resolvedPipeline, err := resolveJobListPipeline(ctx, f, opts.pipeline)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
+		}
+
+		var queueIDs []string
+		if opts.queue != "" {
+			queueIDs, err = lookupQueueIDs(ctx, f, resolvedPipeline.Org, opts.queue)
+			if err != nil {
+				return nil, nil, nil, err
+			}
 		}
 
 		fetchAll := opts.noLimit || opts.queue != "" || opts.duration != "" || opts.orderBy != ""
 		jobs, err := fetchJobsByBuild(ctx, f.RestAPIClient, resolvedPipeline.Org, resolvedPipeline.Name, opts.build, opts, fetchAll)
-		return jobs, resolvedPipeline, err
+		return jobs, resolvedPipeline, queueIDs, err
 	}
 
 	if opts.queue != "" {
 		jobs, err := fetchJobsWithQueueFilter(ctx, f, org, opts)
-		return jobs, nil, err
+		return jobs, nil, nil, err
 	}
 
 	jobs, err := fetchJobs(ctx, f, org, opts, listOpts)
-	return jobs, nil, err
+	return jobs, nil, nil, err
 }
 
 func resolveJobListPipeline(ctx context.Context, f *factory.Factory, pipelineFlag string) (*pipeline.Pipeline, error) {
@@ -377,7 +386,7 @@ func listJobsWithPagination(ctx context.Context, f *factory.Factory, org string,
 
 		// Apply client-side filters if needed
 		if len(noQueueOpts.state) > 0 || noQueueOpts.duration != "" {
-			jobBatch, err = applyClientSideFilters(jobBatch, noQueueOpts)
+			jobBatch, err = applyClientSideFilters(jobBatch, noQueueOpts, nil)
 			if err != nil {
 				return nil, fmt.Errorf("failed to apply filters: %w", err)
 			}
@@ -740,6 +749,10 @@ func mapGraphQLState(graphqlState, exitStatus string) string {
 }
 
 func jobListOptionsFromFlags(opts *jobListOptions) (*buildkite.BuildsListOptions, error) {
+	if opts.build != "" && (opts.since != "" || opts.until != "") {
+		return nil, fmt.Errorf("--since and --until cannot be used with --build")
+	}
+
 	listOpts := &buildkite.BuildsListOptions{
 		ListOptions: buildkite.ListOptions{
 			PerPage: pageSize,
@@ -784,7 +797,7 @@ func getBuildsByPipeline(ctx context.Context, f *factory.Factory, org, pipelineF
 	return builds, err
 }
 
-func applyClientSideFilters(jobs []buildkite.Job, opts jobListOptions) ([]buildkite.Job, error) {
+func applyClientSideFilters(jobs []buildkite.Job, opts jobListOptions, queueIDs []string) ([]buildkite.Job, error) {
 	if opts.queue == "" && len(opts.state) == 0 && opts.duration == "" {
 		return jobs, nil
 	}
@@ -826,7 +839,7 @@ func applyClientSideFilters(jobs []buildkite.Job, opts jobListOptions) ([]buildk
 		job := &jobs[i]
 
 		if opts.queue != "" {
-			if !matchesQueue(*job, opts.queue) {
+			if !matchesQueue(*job, opts.queue, queueIDs) {
 				continue
 			}
 		}
@@ -871,7 +884,11 @@ func applyClientSideFilters(jobs []buildkite.Job, opts jobListOptions) ([]buildk
 	return result, nil
 }
 
-func matchesQueue(job buildkite.Job, queueFilter string) bool {
+func matchesQueue(job buildkite.Job, queueFilter string, queueIDs []string) bool {
+	if len(queueIDs) > 0 {
+		return containsString(queueIDs, job.ClusterQueueID)
+	}
+
 	for _, rule := range job.AgentQueryRules {
 		if strings.Contains(strings.ToLower(rule), "queue="+strings.ToLower(queueFilter)) {
 			return true

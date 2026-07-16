@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Khan/genqlient/graphql"
 	"github.com/buildkite/cli/v3/internal/config"
 	"github.com/buildkite/cli/v3/internal/pipeline"
 	"github.com/buildkite/cli/v3/pkg/cmd/factory"
@@ -58,7 +59,7 @@ func TestFetchJobListByBuildUsesJobsEndpoint(t *testing.T) {
 		t.Fatalf("jobListOptionsFromFlags() error = %v", err)
 	}
 
-	jobs, resolvedPipeline, err := fetchJobList(context.Background(), f, "test-org", opts, listOpts)
+	jobs, resolvedPipeline, _, err := fetchJobList(context.Background(), f, "test-org", opts, listOpts)
 	if err != nil {
 		t.Fatalf("fetchJobList() error = %v", err)
 	}
@@ -167,18 +168,37 @@ func TestFetchJobsByBuildCursorPaginationAndLimits(t *testing.T) {
 func TestBuildJobListFetchesAllPagesBeforeClientFilteringAndOrdering(t *testing.T) {
 	started := time.Now().Add(-30 * time.Minute)
 	firstPage := []buildkite.Job{
-		{ID: "wrong-queue", State: "failed", AgentQueryRules: []string{"queue=other"}, StartedAt: &buildkite.Timestamp{Time: started}, FinishedAt: &buildkite.Timestamp{Time: started.Add(20 * time.Minute)}},
+		{ID: "wrong-queue", State: "failed", ClusterQueueID: "other-queue-id", StartedAt: &buildkite.Timestamp{Time: started}, FinishedAt: &buildkite.Timestamp{Time: started.Add(20 * time.Minute)}},
 	}
 	secondPage := []buildkite.Job{
-		{ID: "short", State: "failed", AgentQueryRules: []string{"queue=test"}, StartedAt: &buildkite.Timestamp{Time: started}, FinishedAt: &buildkite.Timestamp{Time: started.Add(2 * time.Minute)}},
-		{ID: "long", State: "failed", AgentQueryRules: []string{"queue=test"}, StartedAt: &buildkite.Timestamp{Time: started}, FinishedAt: &buildkite.Timestamp{Time: started.Add(15 * time.Minute)}},
+		{ID: "short", State: "failed", ClusterQueueID: "test-queue-id", StartedAt: &buildkite.Timestamp{Time: started}, FinishedAt: &buildkite.Timestamp{Time: started.Add(2 * time.Minute)}},
+		{ID: "long", State: "failed", ClusterQueueID: "test-queue-id", StartedAt: &buildkite.Timestamp{Time: started}, FinishedAt: &buildkite.Timestamp{Time: started.Add(15 * time.Minute)}},
 	}
 
-	var requests int
+	var restRequests int
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests++
-		if requests == 1 {
+		if r.Method == http.MethodPost {
+			var request struct {
+				OperationName string `json:"operationName"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode GraphQL request: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			switch request.OperationName {
+			case "FindClusters":
+				_, _ = w.Write([]byte(`{"data":{"organization":{"clusters":{"edges":[{"node":{"id":"cluster-id","name":"Test"}}],"pageInfo":{"hasNextPage":false}}}}}`))
+			case "FindQueuesForCluster":
+				_, _ = w.Write([]byte(`{"data":{"node":{"__typename":"Cluster","id":"cluster-id","name":"Test","queues":{"edges":[{"node":{"id":"test-queue-id","key":"test"}}],"pageInfo":{"hasNextPage":false}}}}}`))
+			default:
+				t.Fatalf("unexpected GraphQL operation %q", request.OperationName)
+			}
+			return
+		}
+
+		restRequests++
+		if restRequests == 1 {
 			writeJobsPage(t, w, firstPage, server.URL+r.URL.Path+"?after=next&per_page=100")
 			return
 		}
@@ -187,16 +207,17 @@ func TestBuildJobListFetchesAllPagesBeforeClientFilteringAndOrdering(t *testing.
 	t.Cleanup(server.Close)
 
 	f := newJobListTestFactory(t, server.URL, nil)
+	f.GraphQLClient = graphql.NewClient(server.URL, server.Client())
 	opts := jobListOptions{pipeline: "my-app", build: "429", queue: "test", duration: ">1m", orderBy: "duration", limit: 1}
 	listOpts, err := jobListOptionsFromFlags(&opts)
 	if err != nil {
 		t.Fatalf("jobListOptionsFromFlags() error = %v", err)
 	}
-	jobs, _, err := fetchJobList(context.Background(), f, "test-org", opts, listOpts)
+	jobs, _, queueIDs, err := fetchJobList(context.Background(), f, "test-org", opts, listOpts)
 	if err != nil {
 		t.Fatalf("fetchJobList() error = %v", err)
 	}
-	jobs, err = applyClientSideFilters(jobs, opts)
+	jobs, err = applyClientSideFilters(jobs, opts, queueIDs)
 	if err != nil {
 		t.Fatalf("applyClientSideFilters() error = %v", err)
 	}
@@ -205,8 +226,8 @@ func TestBuildJobListFetchesAllPagesBeforeClientFilteringAndOrdering(t *testing.
 		jobs = jobs[:opts.limit]
 	}
 
-	if requests != 2 {
-		t.Fatalf("requests = %d, want all 2 pages", requests)
+	if restRequests != 2 {
+		t.Fatalf("REST requests = %d, want all 2 pages", restRequests)
 	}
 	if len(jobs) != 1 || jobs[0].ID != "long" {
 		t.Fatalf("jobs = %#v, want longest matching job", jobs)
@@ -283,7 +304,7 @@ func TestFetchJobListWithoutBuildRetainsCrossBuildEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("jobListOptionsFromFlags() error = %v", err)
 	}
-	jobs, resolvedPipeline, err := fetchJobList(context.Background(), f, "test-org", opts, listOpts)
+	jobs, resolvedPipeline, _, err := fetchJobList(context.Background(), f, "test-org", opts, listOpts)
 	if err != nil {
 		t.Fatalf("fetchJobList() error = %v", err)
 	}
@@ -292,6 +313,20 @@ func TestFetchJobListWithoutBuildRetainsCrossBuildEndpoint(t *testing.T) {
 	}
 	if len(jobs) != 1 || jobs[0].ID != "cross-build-job" {
 		t.Fatalf("jobs = %#v", jobs)
+	}
+}
+
+func TestJobListOptionsRejectBuildWithBuildTimeFilters(t *testing.T) {
+	tests := []jobListOptions{
+		{build: "429", since: "1h"},
+		{build: "429", until: "30m"},
+	}
+
+	for _, opts := range tests {
+		_, err := jobListOptionsFromFlags(&opts)
+		if err == nil || !strings.Contains(err.Error(), "cannot be used with --build") {
+			t.Fatalf("jobListOptionsFromFlags(%+v) error = %v, want incompatible flags error", opts, err)
+		}
 	}
 }
 
@@ -411,7 +446,7 @@ func TestFilterJobs(t *testing.T) {
 	}
 
 	opts := jobListOptions{duration: ">10m"}
-	filtered, err := applyClientSideFilters(jobs, opts)
+	filtered, err := applyClientSideFilters(jobs, opts, nil)
 	if err != nil {
 		t.Fatalf("applyClientSideFilters failed: %v", err)
 	}
@@ -421,7 +456,7 @@ func TestFilterJobs(t *testing.T) {
 	}
 
 	opts = jobListOptions{queue: "test-queue"}
-	filtered, err = applyClientSideFilters(jobs, opts)
+	filtered, err = applyClientSideFilters(jobs, opts, nil)
 	if err != nil {
 		t.Fatalf("applyClientSideFilters failed: %v", err)
 	}
